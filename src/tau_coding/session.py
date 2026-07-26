@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import string
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from tau_agent.events import AgentEndEvent, MessageEndEvent, ToolExecutionEndEvent
+from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
     AgentMessage,
@@ -100,6 +103,11 @@ from tau_coding.resources import (
     TauResourcePaths,
     resource_paths_with_cwd,
 )
+from tau_coding.runtime import (
+    CodingRunCleanupError,
+    CodingRunHandle,
+    LocalCodingSessionRuntime,
+)
 from tau_coding.session_export import (
     default_session_export_artifact_path,
     export_session_artifact,
@@ -123,10 +131,58 @@ from tau_coding.thinking import (
 from tau_coding.tools import create_bash_tool, create_coding_tools
 
 StreamingBehavior = Literal["steer", "follow_up"]
+_CURRENT_SESSION_OPERATION: ContextVar[tuple[object, object] | None] = ContextVar(
+    "tau_coding_current_session_operation",
+    default=None,
+)
 SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
 )
+
+
+class _DurableOperationCancelledError(RuntimeError):
+    """A storage awaitable cancelled itself before reaching a durable boundary."""
+
+
+async def _close_async_iterator[T](stream: AsyncIterator[T] | None) -> None:
+    """Close a nested stream now so its ownership cleanup is observable."""
+
+    if stream is None:
+        return
+    close = getattr(stream, "aclose", None)
+    if close is not None:
+        await close()
+
+
+async def _await_durable[T](operation: Awaitable[T]) -> T:
+    """Finish one storage boundary before re-delivering caller cancellation."""
+
+    future = asyncio.ensure_future(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise _DurableOperationCancelledError(
+                    "Storage operation was cancelled before completing"
+                ) from exc
+            cancellation = exc
+    if future.cancelled():
+        raise _DurableOperationCancelledError("Storage operation was cancelled before completing")
+    exception = future.exception()
+    if exception is not None:
+        raise exception
+    result = future.result()
+    if cancellation is not None:
+        current = asyncio.current_task()
+        if current is None:
+            raise cancellation
+        current.cancel()
+    return result
+
+
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
 
@@ -292,6 +348,22 @@ class CodingSession:
         self._runtime_model_limits: RuntimeModelLimits | None = None
         self._runtime_model_limits_key: tuple[str, str] | None = None
         self._model_limits_discovery_error: str | None = None
+        self._run_runtime = LocalCodingSessionRuntime()
+        self._operation_lease: object | None = None
+        self._operation_name: str | None = None
+        self._tree_mutation_lock = asyncio.Lock()
+        self._runtime_lease: object | None = None
+        self._runtime_run_id: str | None = None
+        self._runtime_cancel: Callable[[], object] | None = None
+        self._runtime_close: Callable[[], Awaitable[None]] | None = None
+        self._runtime_publish: Callable[[CodingSessionEvent], None] | None = None
+        self._runtime_accepting_controls: Callable[[], bool] | None = None
+        self._runtime_cancellation_requested: Callable[[], bool] | None = None
+        self._runtime_control_started: Callable[[], None] | None = None
+        self._runtime_control_finished: Callable[[], None] | None = None
+        self._durability_error: str | None = None
+        self._closing = False
+        self._closed = False
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -503,9 +575,29 @@ class CodingSession:
         custom_instructions: str | None = None,
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
-        """Move the active leaf to a previous entry, preserving existing history."""
-        if self._harness.is_running:
+        """Move the active leaf while excluding runs and other mutations."""
+
+        if self._runtime_lease is not None or self._harness.is_running:
             raise RuntimeError(TREE_RUNNING_MESSAGE)
+        if self._operation_name in {"direct prompt", "direct continuation"}:
+            raise RuntimeError(TREE_RUNNING_MESSAGE)
+        with self._operation_scope("branch"):
+            return await self._branch_to_entry_impl(
+                entry_id,
+                summarize=summarize,
+                custom_instructions=custom_instructions,
+                replace_instructions=replace_instructions,
+            )
+
+    async def _branch_to_entry_impl(
+        self,
+        entry_id: str,
+        *,
+        summarize: bool,
+        custom_instructions: str | None,
+        replace_instructions: bool,
+    ) -> SessionTreeBranchResult:
+        """Move the active leaf to a previous entry, preserving existing history."""
         entries = await self._read_session_entries()
         by_id = {entry.id: entry for entry in entries}
         if entry_id not in by_id:
@@ -743,6 +835,12 @@ class CodingSession:
         return dict(metadata.cost) if metadata.cost else None
 
     async def emit_pending_session_start(self) -> None:
+        """Emit startup hooks under one lifecycle operation lease."""
+
+        with self._operation_scope("session startup"):
+            await self._emit_pending_session_start_impl()
+
+    async def _emit_pending_session_start_impl(self) -> None:
         """Emit the `session_start` deferred by `load`, once per session.
 
         Hosts call this after installing their UI bridge so `session_start`
@@ -763,12 +861,14 @@ class CodingSession:
         details: dict[str, JSONValue] | None = None,
     ) -> None:
         """Queue a steering user message (extension runtime seam)."""
+        self._ensure_runtime_accepts_controls()
         message: AgentMessage = (
             CustomMessage(custom_type=custom_type, content=content, details=details)
             if custom_type is not None
             else UserMessage(content=content)
         )
         self._harness.steer_message(message)
+        self._publish_runtime_queue_update()
 
     def queue_follow_up_message(
         self,
@@ -778,26 +878,40 @@ class CodingSession:
         details: dict[str, JSONValue] | None = None,
     ) -> None:
         """Queue a follow-up user message (extension runtime seam)."""
+        self._ensure_runtime_accepts_controls()
         message: AgentMessage = (
             CustomMessage(custom_type=custom_type, content=content, details=details)
             if custom_type is not None
             else UserMessage(content=content)
         )
         self._harness.follow_up_message(message)
+        self._publish_runtime_queue_update()
 
     async def append_custom_entry(self, namespace: str, data: dict[str, JSONValue]) -> None:
+        """Persist extension state under the active operation's ownership."""
+
+        with self._operation_scope("append custom entry", allow_current_owner=True):
+            await self._append_custom_entry_impl(namespace, data)
+
+    async def _append_custom_entry_impl(
+        self,
+        namespace: str,
+        data: dict[str, JSONValue],
+    ) -> None:
         """Persist an extension-owned custom entry on the active branch path.
 
         The entry advances the append-only tree parent chain so it stays on the
         replayed root-to-leaf path (off-path custom entries would be invisible
         to `SessionState` after resume).
         """
-        entry = CustomEntry(parent_id=self._last_parent_id, namespace=namespace, data=data)
-        await self._append_session_entry(entry)
-        self._last_parent_id = entry.id
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        await self._refresh_persisted_state(leaf_id=entry.id)
+        async with self._tree_mutation_lock:
+            self._ensure_current_operation_owner()
+            entry = CustomEntry(parent_id=self._last_parent_id, namespace=namespace, data=data)
+            await self._append_session_entry(entry)
+            self._last_parent_id = entry.id
+            leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+            await self._append_session_entry(leaf)
+            await self._refresh_persisted_state(leaf_id=entry.id)
 
     @property
     def session_id(self) -> str | None:
@@ -822,7 +936,50 @@ class CodingSession:
     @property
     def is_running(self) -> bool:
         """Return whether this session currently has an active agent run."""
-        return self._harness.is_running
+        return self._runtime_lease is not None or self._harness.is_running
+
+    @property
+    def is_busy(self) -> bool:
+        """Return whether a run or state-changing session operation owns the session."""
+
+        return self._operation_lease is not None or self._harness.is_running
+
+    @property
+    def active_run_id(self) -> str | None:
+        """Return the active session-level run id, if this session owns one."""
+
+        return self._runtime_run_id
+
+    @property
+    def run_runtime(self) -> LocalCodingSessionRuntime:
+        """Return the in-memory runtime retaining this session's run history."""
+
+        return self._run_runtime
+
+    def start_run(
+        self,
+        content: str,
+        *,
+        parent_run_id: str | None = None,
+        source: Literal["interactive", "extension"] = "interactive",
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> CodingRunHandle:
+        """Start a background-owned run covering the full prompt lifecycle."""
+
+        return self._run_runtime.prompt(
+            self,
+            content,
+            parent_run_id=parent_run_id,
+            source=source,
+            custom_type=custom_type,
+            details=details,
+        )
+
+    def start_continue_run(self, *, parent_run_id: str | None = None) -> CodingRunHandle:
+        """Start a background-owned continuation covering the full session lifecycle."""
+
+        return self._run_runtime.continue_(self, parent_run_id=parent_run_id)
 
     @property
     def queued_messages(self) -> QueuedMessages:
@@ -846,7 +1003,236 @@ class CodingSession:
 
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
+        self._ensure_current_operation_owner()
+        if self._runtime_cancel is not None:
+            self._runtime_cancel()
+            return
         self._harness.cancel()
+
+    def _claim_runtime_lease(self, run_id: str) -> object:
+        """Synchronously reserve this session for one background run."""
+
+        if self._runtime_lease is not None:
+            raise RuntimeError(f"CodingSession is reserved by run {self._runtime_run_id}")
+        lease = self._claim_operation(f"run {run_id}")
+        self._runtime_lease = lease
+        self._runtime_run_id = run_id
+        return lease
+
+    def _bind_runtime_callbacks(
+        self,
+        lease: object,
+        *,
+        cancel: Callable[[], object],
+        close: Callable[[], Awaitable[None]],
+        publish: Callable[[CodingSessionEvent], None],
+        accepting_controls: Callable[[], bool],
+        cancellation_requested: Callable[[], bool],
+        control_started: Callable[[], None],
+        control_finished: Callable[[], None],
+    ) -> None:
+        """Bind the active handle's control callbacks to compatibility APIs."""
+
+        self._ensure_runtime_lease(lease)
+        self._runtime_cancel = cancel
+        self._runtime_close = close
+        self._runtime_publish = publish
+        self._runtime_accepting_controls = accepting_controls
+        self._runtime_cancellation_requested = cancellation_requested
+        self._runtime_control_started = control_started
+        self._runtime_control_finished = control_finished
+
+    def _ensure_runtime_lease(self, lease: object) -> None:
+        if self._runtime_lease is not lease:
+            raise RuntimeError("CodingSession runtime lease is not held by this run")
+
+    def _release_runtime_lease(self, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        self._runtime_cancel = None
+        self._runtime_close = None
+        self._runtime_publish = None
+        self._runtime_accepting_controls = None
+        self._runtime_cancellation_requested = None
+        self._runtime_control_started = None
+        self._runtime_control_finished = None
+        self._runtime_run_id = None
+        self._runtime_lease = None
+        self._release_operation(lease)
+
+    def _cancel_with_runtime_lease(self, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        self._harness.cancel()
+
+    def _clear_queues_with_runtime_lease(self, lease: object) -> QueueUpdateEvent:
+        self._ensure_runtime_lease(lease)
+        self._harness.clear_queues()
+        return self.queue_update_event()
+
+    def _result_messages_with_runtime_lease(
+        self,
+        lease: object,
+        observed: tuple[AgentMessage, ...],
+    ) -> tuple[AgentMessage, ...]:
+        """Include durable cleanup messages that have no lifecycle event."""
+
+        self._ensure_runtime_lease(lease)
+        result = [message.model_copy(deep=True) for message in observed]
+        if not observed:
+            return tuple(result)
+        current = self._harness.messages
+        last_observed = observed[-1]
+        for index in range(len(current) - 1, -1, -1):
+            if current[index] != last_observed:
+                continue
+            result.extend(message.model_copy(deep=True) for message in current[index + 1 :])
+            break
+        return tuple(result)
+
+    def _durability_failure_with_runtime_lease(self, lease: object) -> str | None:
+        """Expose durability poison to the runtime's cancellation classifier."""
+
+        self._ensure_runtime_lease(lease)
+        return self._durability_error
+
+    def _claim_operation(
+        self,
+        operation: str,
+        *,
+        allow_durability_recovery: bool = False,
+    ) -> object:
+        self._ensure_current_operation_owner()
+        self._ensure_open()
+        if self._durability_error is not None and not allow_durability_recovery:
+            raise RuntimeError(
+                "CodingSession has an unresolved persistence failure; "
+                "resume or replace the session before continuing"
+            )
+        if self._operation_lease is not None:
+            if self._runtime_lease is self._operation_lease or self._operation_name in {
+                "direct prompt",
+                "direct continuation",
+            }:
+                raise RuntimeError("CodingSession is already running")
+            owner = self._operation_name or "another operation"
+            raise RuntimeError(f"CodingSession is busy with {owner}")
+        if self._harness.is_running:
+            raise RuntimeError("CodingSession already has a directly driven prompt")
+        lease = object()
+        self._operation_lease = lease
+        self._operation_name = operation
+        return lease
+
+    def _release_operation(self, lease: object) -> None:
+        if self._operation_lease is not lease:
+            raise RuntimeError("CodingSession operation lease is not held by this operation")
+        self._operation_name = None
+        self._operation_lease = None
+
+    @contextmanager
+    def _operation_scope(
+        self,
+        operation: str,
+        *,
+        allow_current_owner: bool = False,
+        inherit_context: bool = True,
+        allow_durability_recovery: bool = False,
+    ) -> Iterator[object]:
+        inherited_owner = _CURRENT_SESSION_OPERATION.get()
+        if allow_current_owner and inherited_owner is not None and inherited_owner[0] is self:
+            inherited_lease = inherited_owner[1]
+            if self._operation_lease is not inherited_lease:
+                raise RuntimeError("CodingSession operation ownership has ended")
+            yield inherited_lease
+            return
+        lease = self._claim_operation(
+            operation,
+            allow_durability_recovery=allow_durability_recovery,
+        )
+        context_token = _CURRENT_SESSION_OPERATION.set((self, lease)) if inherit_context else None
+        try:
+            yield lease
+        finally:
+            if context_token is not None:
+                _CURRENT_SESSION_OPERATION.reset(context_token)
+            self._release_operation(lease)
+
+    @contextmanager
+    def _operation_context(self, lease: object) -> Iterator[None]:
+        self._ensure_operation_lease(lease)
+        context_token = _CURRENT_SESSION_OPERATION.set((self, lease))
+        try:
+            yield
+        finally:
+            _CURRENT_SESSION_OPERATION.reset(context_token)
+
+    def _ensure_operation_lease(self, lease: object) -> None:
+        if self._operation_lease is not lease:
+            raise RuntimeError("CodingSession operation ownership has ended")
+
+    def _ensure_current_operation_owner(self) -> None:
+        """Reject work resumed from a run context whose lease has ended."""
+
+        inherited_owner = _CURRENT_SESSION_OPERATION.get()
+        if (
+            inherited_owner is not None
+            and inherited_owner[0] is self
+            and inherited_owner[1] is not self._operation_lease
+        ):
+            raise RuntimeError("CodingSession operation ownership has ended")
+
+    async def _emit_extension_event(
+        self,
+        event: CodingSessionEvent,
+        lease: object,
+    ) -> None:
+        with self._operation_context(lease):
+            await self._extension_runtime.emit_event(event)
+
+    async def _iterate_agent_events(
+        self,
+        stream: AsyncIterator[AgentEvent],
+        lease: object,
+    ) -> AsyncIterator[AgentEvent]:
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                with self._operation_context(lease):
+                    event = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            yield event
+
+    def _ensure_runtime_accepts_controls(self, lease: object | None = None) -> None:
+        self._ensure_current_operation_owner()
+        self._ensure_open()
+        if lease is not None and self._runtime_lease is not lease:
+            raise RuntimeError("CodingSession run ended before the control was queued")
+        accepting = self._runtime_accepting_controls
+        if self._runtime_lease is not None and accepting is not None and not accepting():
+            raise RuntimeError("CodingSession is settling and no longer accepts controls")
+
+    def _raise_if_runtime_cancelled(self, lease: object | None) -> None:
+        if lease is None:
+            return
+        self._ensure_runtime_lease(lease)
+        cancelled = self._runtime_cancellation_requested
+        if cancelled is not None and cancelled():
+            raise asyncio.CancelledError
+
+    def _ensure_idle(self, operation: str) -> None:
+        self._ensure_current_operation_owner()
+        self._ensure_open()
+        if self.is_busy:
+            raise RuntimeError(f"Cannot {operation} while CodingSession is running")
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("CodingSession is closed")
+        if self._closing:
+            raise RuntimeError("CodingSession is closing")
+
+    def _mark_durability_failure(self, exc: Exception) -> None:
+        self._durability_error = f"{type(exc).__name__}: {exc}"
 
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a coding-session event."""
@@ -857,20 +1243,33 @@ class CodingSession:
 
     def clear_queued_messages(self) -> QueuedMessages:
         """Clear queued steering and follow-up messages."""
-        return self._harness.clear_queues()
+        self._ensure_runtime_accepts_controls()
+        messages = self._harness.clear_queues()
+        self._publish_runtime_queue_update()
+        return messages
 
     def pop_latest_follow_up_message(self) -> str | None:
         """Remove and return the most recently queued follow-up message."""
+        self._ensure_runtime_accepts_controls()
         message = self._harness.pop_latest_follow_up()
+        self._publish_runtime_queue_update()
         return None if message is None else message_text(message)
 
     def pop_latest_steering_message(self) -> str | None:
         """Remove and return the most recently queued steering message."""
+        self._ensure_runtime_accepts_controls()
         message = self._harness.pop_latest_steering()
+        self._publish_runtime_queue_update()
         return None if message is None else message_text(message)
+
+    def _publish_runtime_queue_update(self) -> None:
+        publish = self._runtime_publish
+        if publish is not None:
+            publish(self.queue_update_event())
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
+        self._ensure_idle("change model")
         provider = self._active_provider_config()
         if provider is not None:
             validate_provider_model(provider, model)
@@ -887,6 +1286,7 @@ class CodingSession:
 
     def set_model_choice(self, choice: ModelChoice) -> None:
         """Switch provider/model as one operation."""
+        self._ensure_idle("change model")
         if choice.provider_name == self.provider_name:
             self.set_model(choice.model)
             return
@@ -898,6 +1298,7 @@ class CodingSession:
 
     def toggle_scoped_model(self, choice: ModelChoice) -> tuple[ModelChoice, ...]:
         """Add or remove a model from the persisted scoped model list."""
+        self._ensure_idle("change scoped models")
         if self._provider_settings is None:
             raise ProviderConfigError("Provider settings are not available for this session")
         available = set(self.available_model_choices)
@@ -932,6 +1333,7 @@ class CodingSession:
 
     def set_provider(self, provider_name: str, *, persist_default: bool = True) -> None:
         """Switch the active provider and reset to that provider's default model."""
+        self._ensure_idle("change provider")
         if self._provider_settings is None:
             raise ProviderConfigError("Provider settings are not available for this session")
         provider_config = self._provider_settings.get_provider(provider_name)
@@ -986,6 +1388,12 @@ class CodingSession:
             )
 
     async def set_thinking_level(self, level: str) -> str:
+        """Persist and activate a thinking mode under one mutation lease."""
+
+        with self._operation_scope("set thinking level"):
+            return await self._set_thinking_level_impl(level)
+
+    async def _set_thinking_level_impl(self, level: str) -> str:
         """Persist and activate a thinking mode for future turns."""
         normalized = normalize_thinking_level(level)
         available = self.available_thinking_levels
@@ -1120,6 +1528,12 @@ class CodingSession:
             self._model_limits_discovery_error = f"{type(exc).__name__}: {exc}"
 
     async def reload(self) -> CodingReloadSummary:
+        """Reload resources while excluding runs and other session mutations."""
+
+        with self._operation_scope("reload"):
+            return await self._reload_impl()
+
+    async def _reload_impl(self) -> CodingReloadSummary:
         """Reload resources and extensions with an awaited lifecycle boundary.
 
         Outgoing handlers finish ``session_shutdown(reason="reload")`` while
@@ -1233,6 +1647,7 @@ class CodingSession:
 
     def reload_provider_settings(self) -> None:
         """Reload provider settings for login and model-selection flows."""
+        self._ensure_idle("reload provider settings")
         if self._provider_settings is None:
             return
         previous_settings = self._provider_settings
@@ -1247,6 +1662,12 @@ class CodingSession:
             raise
 
     async def resume(self, session_id: str) -> str:
+        """Resume a session while excluding runs and other state replacement."""
+
+        with self._operation_scope("resume", allow_durability_recovery=True):
+            return await self._resume_impl(session_id)
+
+    async def _resume_impl(self, session_id: str) -> str:
         """Replace this session's active state with another indexed session."""
         manager = self._config.session_manager
         if manager is None:
@@ -1316,6 +1737,15 @@ class CodingSession:
         return f"Resumed session: {record.id}"
 
     async def new_session(self) -> str:
+        """Create a session while excluding runs and other state replacement."""
+
+        with self._operation_scope(
+            "create a new session",
+            allow_durability_recovery=True,
+        ):
+            return await self._new_session_impl()
+
+    async def _new_session_impl(self) -> str:
         """Replace this session's active state with a pending unindexed session."""
         manager = self._config.session_manager
         if manager is None:
@@ -1397,12 +1827,19 @@ class CodingSession:
         self._auto_compact_enabled = replacement._auto_compact_enabled
         self._thinking_level = replacement._thinking_level
         self._pending_initial_entries = replacement._pending_initial_entries
+        self._durability_error = None
         self._extension_runtime = replacement._extension_runtime
         self._extension_runtime.bind(self)
         self._extension_runtime.attach_harness_listener(self._harness.subscribe)
         await self._extension_runtime.emit_session_start(reason)
 
     async def compact(self, instructions: str | None = None) -> str:
+        """Compact the session while excluding runs and other mutations."""
+
+        with self._operation_scope("compact"):
+            return await self._compact_impl(instructions)
+
+    async def _compact_impl(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
         plan = self._manual_compaction_plan()
         summary = await self._generate_compaction_summary(
@@ -1416,11 +1853,35 @@ class CodingSession:
         return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
 
     async def aclose(self) -> None:
-        """Close runtime providers created by this coding session."""
-        await self._extension_runtime.emit_session_shutdown("quit")
-        for provider in self._owned_providers:
-            await provider.aclose()
-        self._owned_providers.clear()
+        """Stop an active run, shut down extensions, and close owned providers."""
+        self._ensure_current_operation_owner()
+        if self._closed:
+            return
+        if self._closing:
+            raise RuntimeError("CodingSession is already closing")
+        self._closing = True
+        try:
+            runtime_close = self._runtime_close
+            if runtime_close is not None:
+                await runtime_close()
+            await self._run_runtime.shutdown()
+            if self._operation_lease is not None or self._harness.is_running:
+                raise RuntimeError("Cannot close CodingSession during a direct operation")
+            close_lease = object()
+            self._operation_lease = close_lease
+            self._operation_name = "close"
+            context_token = _CURRENT_SESSION_OPERATION.set((self, close_lease))
+            try:
+                await self._extension_runtime.emit_session_shutdown("quit")
+                for provider in self._owned_providers:
+                    await provider.aclose()
+                self._owned_providers.clear()
+                self._closed = True
+            finally:
+                _CURRENT_SESSION_OPERATION.reset(context_token)
+                self._release_operation(close_lease)
+        finally:
+            self._closing = False
 
     def handle_command(self, text: str) -> CommandResult:
         """Handle coding-session slash commands.
@@ -1428,12 +1889,14 @@ class CodingSession:
         Prompt-template slash commands are expansion directives, so they remain
         unhandled here and flow through `prompt()` for on-the-fly replacement.
         """
+        self._ensure_current_operation_owner()
         if expand_prompt_template_command(text, self._prompt_templates) is not None:
             return CommandResult(handled=False)
         return self._command_registry.execute(self, text)
 
     def ensure_session_indexed(self) -> None:
         """Persist pending session metadata and add this session to the resume index."""
+        self._ensure_idle("index the session")
         if self._config.session_id is None or self._config.session_manager is None:
             return
         if self._config.session_manager.get_session(self._config.session_id) is None:
@@ -1455,6 +1918,20 @@ class CodingSession:
         return expanded_skill if expanded_skill is not None else text
 
     async def run_terminal_command(
+        self,
+        command: str,
+        *,
+        add_to_context: bool,
+    ) -> TerminalCommandResult:
+        """Run a command, reserving the session if output enters context."""
+
+        self._ensure_open()
+        if add_to_context:
+            with self._operation_scope("add terminal output"):
+                return await self._run_terminal_command_impl(command, add_to_context=True)
+        return await self._run_terminal_command_impl(command, add_to_context=False)
+
+    async def _run_terminal_command_impl(
         self,
         command: str,
         *,
@@ -1505,6 +1982,137 @@ class CodingSession:
         custom_type: str | None = None,
         details: dict[str, JSONValue] | None = None,
     ) -> AsyncIterator[CodingSessionEvent]:
+        """Drive a prompt from the caller-owned compatibility API."""
+
+        if streaming_behavior is not None and (
+            self._runtime_lease is not None or self._harness.is_running
+        ):
+            control_finished: Callable[[], None] | None = None
+            if self._runtime_lease is not None:
+                control_started = self._runtime_control_started
+                control_finished = self._runtime_control_finished
+                if control_started is None or control_finished is None:
+                    raise RuntimeError("CodingSession runtime controls are not bound")
+                control_started()
+            operation_lease = self._operation_lease
+            if operation_lease is None:
+                if control_finished is not None:
+                    control_finished()
+                raise RuntimeError("CodingSession has no active operation owner")
+            stream = self._prompt_impl(
+                content,
+                streaming_behavior=streaming_behavior,
+                source=source,
+                custom_type=custom_type,
+                details=details,
+                runtime_lease=None,
+                operation_lease=operation_lease,
+                run_id=None,
+                control_only=False,
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                try:
+                    await _close_async_iterator(stream)
+                finally:
+                    if control_finished is not None:
+                        control_finished()
+            return
+
+        with self._operation_scope(
+            "direct prompt",
+            inherit_context=False,
+        ) as operation_lease:
+            stream = self._prompt_impl(
+                content,
+                streaming_behavior=streaming_behavior,
+                source=source,
+                custom_type=custom_type,
+                details=details,
+                runtime_lease=None,
+                operation_lease=operation_lease,
+                run_id=None,
+                control_only=False,
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await _close_async_iterator(stream)
+
+    async def _prompt_with_runtime_lease(
+        self,
+        content: str,
+        lease: object,
+        *,
+        run_id: str,
+        source: Literal["interactive", "extension"] = "interactive",
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Drive a prompt for the session-level runtime that owns ``lease``."""
+
+        self._ensure_runtime_lease(lease)
+        stream = self._prompt_impl(
+            content,
+            streaming_behavior=None,
+            source=source,
+            custom_type=custom_type,
+            details=details,
+            runtime_lease=lease,
+            operation_lease=lease,
+            run_id=run_id,
+            control_only=False,
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_async_iterator(stream)
+
+    async def _queue_control_with_runtime_lease(
+        self,
+        content: str,
+        lease: object,
+        *,
+        streaming_behavior: StreamingBehavior,
+        run_id: str,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Queue one control through normal input hooks for the owned run."""
+
+        self._ensure_runtime_lease(lease)
+        stream = self._prompt_impl(
+            content,
+            streaming_behavior=streaming_behavior,
+            source="interactive",
+            custom_type=None,
+            details=None,
+            runtime_lease=lease,
+            operation_lease=lease,
+            run_id=run_id,
+            control_only=True,
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_async_iterator(stream)
+
+    async def _prompt_impl(
+        self,
+        content: str,
+        *,
+        streaming_behavior: StreamingBehavior | None,
+        source: Literal["interactive", "extension"],
+        custom_type: str | None,
+        details: dict[str, JSONValue] | None,
+        runtime_lease: object | None,
+        operation_lease: object,
+        run_id: str | None,
+        control_only: bool,
+    ) -> AsyncIterator[CodingSessionEvent]:
         """Append a user prompt, run the agent, and persist new messages.
 
         ``custom_type``/``details`` attach custom-message render metadata to the
@@ -1513,10 +2121,24 @@ class CodingSession:
         initiated the turn for the `input` hook (``"extension"`` when an
         extension started it, ``"interactive"`` otherwise).
         """
-        context = self._diagnostic_context()
-        input_outcome = await self._extension_runtime.run_input_hooks(
-            content, source=source, streaming_behavior=streaming_behavior
-        )
+        if runtime_lease is not None:
+            self._ensure_runtime_lease(runtime_lease)
+        runtime_owned = runtime_lease is not None and self._runtime_lease is runtime_lease
+        externally_owned = self._runtime_lease is not None and not runtime_owned
+        control_lease = runtime_lease if control_only else self._runtime_lease
+        if externally_owned and streaming_behavior is None:
+            raise RuntimeError(
+                "CodingSession is already running; pass streaming_behavior to queue a message."
+            )
+        context = self._diagnostic_context(run_id=run_id or self._runtime_run_id)
+        with self._operation_context(operation_lease):
+            input_outcome = await self._extension_runtime.run_input_hooks(
+                content, source=source, streaming_behavior=streaming_behavior
+            )
+        self._ensure_operation_lease(operation_lease)
+        self._raise_if_runtime_cancelled(runtime_lease)
+        if externally_owned or control_only:
+            self._ensure_runtime_accepts_controls(control_lease)
         if input_outcome.handled:
             if input_outcome.message:
                 self._extension_runtime.ui.notify(input_outcome.message)
@@ -1534,17 +2156,24 @@ class CodingSession:
             )
             raise
 
-        if self._harness.is_running:
+        if self._harness.is_running or externally_owned or control_only:
+            publish_control = externally_owned or control_only
+            if publish_control:
+                self._ensure_runtime_accepts_controls(control_lease)
             if streaming_behavior == "steer":
                 self._harness.steer(expanded_content)
                 session_event_0 = self.queue_update_event()
-                await self._extension_runtime.emit_event(session_event_0)
+                if publish_control and self._runtime_publish is not None:
+                    self._runtime_publish(session_event_0)
+                await self._emit_extension_event(session_event_0, operation_lease)
                 yield session_event_0
                 return
             if streaming_behavior == "follow_up":
                 self._harness.follow_up(expanded_content)
                 session_event_0 = self.queue_update_event()
-                await self._extension_runtime.emit_event(session_event_0)
+                if publish_control and self._runtime_publish is not None:
+                    self._runtime_publish(session_event_0)
+                await self._emit_extension_event(session_event_0, operation_lease)
                 yield session_event_0
                 return
             raise RuntimeError(
@@ -1553,9 +2182,13 @@ class CodingSession:
 
         await self._refresh_runtime_model_limits()
         await self._try_auto_compact(context=context, phase="auto_compact_before_prompt")
+        self._raise_if_runtime_cancelled(runtime_lease)
         persisted_count = len(self._harness.messages)
+        cleanup_persisted_count = persisted_count
         auto_name_attempted = False
         overflow_message: AssistantMessage | None = None
+        events: AsyncIterator[AgentEvent] | None = None
+        retry_events: AsyncIterator[AgentEvent] | None = None
         try:
             prompt_message: AgentMessage
             if custom_type is not None:
@@ -1569,10 +2202,11 @@ class CodingSession:
                 prompt_message = UserMessage(content=expanded_content)
             events = self._harness.prompt_message(prompt_message)
             self._invalidate_context_usage_cache()
-            async for event in events:
+            async for event in self._iterate_agent_events(events, operation_lease):
                 auto_name_message: str | None = None
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
+                    cleanup_persisted_count = persisted_count
                     if not auto_name_attempted and isinstance(event.message, UserMessage):
                         auto_name_attempted = True
                         auto_name_message = event.message.text
@@ -1591,7 +2225,10 @@ class CodingSession:
                     if is_context_overflow_error(event.message):
                         overflow_message = event.message
                 if isinstance(event, AgentEndEvent):
-                    yield SessionAgentEndEvent(messages=event.messages, will_retry=False)
+                    yield SessionAgentEndEvent(
+                        messages=event.messages,
+                        will_retry=overflow_message is not None,
+                    )
                 else:
                     yield event
                 # Let frontends render the confirmed, expanded prompt before
@@ -1599,11 +2236,16 @@ class CodingSession:
                 if auto_name_message is not None:
                     await self._try_auto_name_session(auto_name_message, context=context)
             persisted_count = await self._persist_messages_since(persisted_count)
+            cleanup_persisted_count = persisted_count
+            self._raise_if_runtime_cancelled(runtime_lease)
             if overflow_message is not None:
                 session_event_1 = CompactionStartEvent(reason="overflow")
-                await self._extension_runtime.emit_event(session_event_1)
+                await self._emit_extension_event(session_event_1, operation_lease)
                 yield session_event_1
                 compacted = await self._try_overflow_compact(context=context)
+                if compacted:
+                    cleanup_persisted_count = len(self._harness.messages)
+                self._raise_if_runtime_cancelled(runtime_lease)
                 compaction_end = CompactionEndEvent(
                     reason="overflow",
                     result=None,
@@ -1611,39 +2253,46 @@ class CodingSession:
                     will_retry=compacted,
                     error_message=None if compacted else "Overflow compaction failed",
                 )
-                await self._extension_runtime.emit_event(compaction_end)
+                await self._emit_extension_event(compaction_end, operation_lease)
                 yield compaction_end
                 if compacted:
+                    self._raise_if_runtime_cancelled(runtime_lease)
                     retry_start = AutoRetryStartEvent(
                         attempt=1,
                         max_attempts=1,
                         delay_ms=0,
                         error_message=overflow_message.error_message or "Context overflow",
                     )
-                    await self._extension_runtime.emit_event(retry_start)
+                    await self._emit_extension_event(retry_start, operation_lease)
                     yield retry_start
                     retry_persisted_count = len(self._harness.messages)
+                    cleanup_persisted_count = retry_persisted_count
+                    retry_terminal_message: AssistantMessage | None = None
                     retry_events = self._harness.continue_()
                     self._invalidate_context_usage_cache()
-                    async for retry_event in retry_events:
+                    async for retry_event in self._iterate_agent_events(
+                        retry_events,
+                        operation_lease,
+                    ):
                         if isinstance(retry_event, MessageEndEvent):
                             retry_persisted_count = await self._persist_messages_since(
                                 retry_persisted_count
                             )
+                            cleanup_persisted_count = retry_persisted_count
                         if isinstance(retry_event, ToolExecutionEndEvent):
                             self._invalidate_context_usage_cache()
-                        if (
-                            isinstance(retry_event, MessageEndEvent)
-                            and isinstance(retry_event.message, AssistantMessage)
-                            and retry_event.message.stop_reason == "error"
+                        if isinstance(retry_event, MessageEndEvent) and isinstance(
+                            retry_event.message, AssistantMessage
                         ):
-                            self._last_diagnostic_log_path = (
-                                self._diagnostic_logger.log_assistant_error(
-                                    context=context,
-                                    phase="agent_loop_retry",
-                                    message=retry_event.message,
+                            retry_terminal_message = retry_event.message
+                            if retry_event.message.stop_reason == "error":
+                                self._last_diagnostic_log_path = (
+                                    self._diagnostic_logger.log_assistant_error(
+                                        context=context,
+                                        phase="agent_loop_retry",
+                                        message=retry_event.message,
+                                    )
                                 )
-                            )
                         if isinstance(retry_event, AgentEndEvent):
                             yield SessionAgentEndEvent(
                                 messages=retry_event.messages,
@@ -1651,35 +2300,154 @@ class CodingSession:
                             )
                         else:
                             yield retry_event
-                    await self._persist_messages_since(retry_persisted_count)
-                    session_event_4 = AutoRetryEndEvent(success=True, attempt=1, final_error=None)
-                    await self._extension_runtime.emit_event(session_event_4)
+                    retry_persisted_count = await self._persist_messages_since(
+                        retry_persisted_count
+                    )
+                    cleanup_persisted_count = retry_persisted_count
+                    self._raise_if_runtime_cancelled(runtime_lease)
+                    retry_success = (
+                        retry_terminal_message is not None
+                        and retry_terminal_message.stop_reason not in {"error", "aborted"}
+                    )
+                    retry_error = None
+                    if not retry_success:
+                        retry_error = (
+                            retry_terminal_message.error_message
+                            if retry_terminal_message is not None
+                            else "Retry produced no assistant message"
+                        )
+                    session_event_4 = AutoRetryEndEvent(
+                        success=retry_success,
+                        attempt=1,
+                        final_error=retry_error,
+                    )
+                    await self._emit_extension_event(session_event_4, operation_lease)
                     yield session_event_4
                 session_event_5 = AgentSettledEvent()
-                await self._extension_runtime.emit_event(session_event_5)
+                await self._emit_extension_event(session_event_5, operation_lease)
                 yield session_event_5
                 return
+            self._raise_if_runtime_cancelled(runtime_lease)
             await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
+            self._raise_if_runtime_cancelled(runtime_lease)
             session_event_5 = AgentSettledEvent()
-            await self._extension_runtime.emit_event(session_event_5)
+            await self._emit_extension_event(session_event_5, operation_lease)
             yield session_event_5
+        except asyncio.CancelledError:
+            self._harness.cancel()
+            teardown_error: BaseException | None = None
+            try:
+                await _close_async_iterator(retry_events)
+            except (asyncio.CancelledError, Exception) as exc:  # persistence must still run
+                teardown_error = exc
+            retry_events = None
+            try:
+                await _close_async_iterator(events)
+            except (asyncio.CancelledError, Exception) as exc:  # persistence must still run
+                teardown_error = teardown_error or exc
+            events = None
+            if teardown_error is not None:
+                with suppress(Exception):
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=context,
+                        phase="agent_loop_cancel_teardown",
+                        exc=teardown_error,
+                    )
+            try:
+                await self._persist_messages_since(cleanup_persisted_count)
+            except Exception as exc:
+                with suppress(Exception):
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=context,
+                        phase="agent_loop_cancel_cleanup",
+                        exc=exc,
+                    )
+                raise CodingRunCleanupError(
+                    "Failed to persist messages while cancelling the coding run"
+                ) from exc
+            raise
         except Exception as exc:
+            if (
+                runtime_lease is not None
+                and self._runtime_cancellation_requested is not None
+                and self._runtime_cancellation_requested()
+            ):
+                try:
+                    await self._persist_messages_since(cleanup_persisted_count)
+                except Exception as cleanup_exc:
+                    raise CodingRunCleanupError(
+                        "Failed to persist messages while cancelling the coding run"
+                    ) from cleanup_exc
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
                 phase="agent_loop",
                 exc=exc,
             )
             raise
+        finally:
+            await _close_async_iterator(retry_events)
+            await _close_async_iterator(events)
 
     async def continue_(self) -> AsyncIterator[CodingSessionEvent]:
+        """Continue from restored state through the caller-owned compatibility API."""
+
+        with self._operation_scope(
+            "direct continuation",
+            inherit_context=False,
+        ) as operation_lease:
+            stream = self._continue_impl(
+                runtime_lease=None,
+                operation_lease=operation_lease,
+                run_id=None,
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await _close_async_iterator(stream)
+
+    async def _continue_with_runtime_lease(
+        self,
+        lease: object,
+        *,
+        run_id: str,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Continue from restored state for the runtime that owns ``lease``."""
+
+        self._ensure_runtime_lease(lease)
+        stream = self._continue_impl(
+            runtime_lease=lease,
+            operation_lease=lease,
+            run_id=run_id,
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_async_iterator(stream)
+
+    async def _continue_impl(
+        self,
+        *,
+        runtime_lease: object | None,
+        operation_lease: object,
+        run_id: str | None,
+    ) -> AsyncIterator[CodingSessionEvent]:
         """Continue the agent from restored state and persist new messages."""
-        context = self._diagnostic_context()
+
+        if runtime_lease is not None:
+            self._ensure_runtime_lease(runtime_lease)
+        elif self._runtime_lease is not None:
+            raise RuntimeError(f"CodingSession is reserved by run {self._runtime_run_id}")
+        context = self._diagnostic_context(run_id=run_id or self._runtime_run_id)
         await self._refresh_runtime_model_limits()
+        self._raise_if_runtime_cancelled(runtime_lease)
         persisted_count = len(self._harness.messages)
+        events: AsyncIterator[AgentEvent] | None = None
         try:
             events = self._harness.continue_()
             self._invalidate_context_usage_cache()
-            async for event in events:
+            async for event in self._iterate_agent_events(events, operation_lease):
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
                 if isinstance(event, ToolExecutionEndEvent):
@@ -1699,25 +2467,68 @@ class CodingSession:
                 else:
                     yield event
             await self._persist_messages_since(persisted_count)
+            self._raise_if_runtime_cancelled(runtime_lease)
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
+            self._raise_if_runtime_cancelled(runtime_lease)
             session_event_5 = AgentSettledEvent()
-            await self._extension_runtime.emit_event(session_event_5)
+            await self._emit_extension_event(session_event_5, operation_lease)
             yield session_event_5
+        except asyncio.CancelledError:
+            self._harness.cancel()
+            teardown_error: BaseException | None = None
+            try:
+                await _close_async_iterator(events)
+            except (asyncio.CancelledError, Exception) as exc:  # persistence must still run
+                teardown_error = exc
+            events = None
+            if teardown_error is not None:
+                with suppress(Exception):
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=context,
+                        phase="agent_loop_cancel_teardown",
+                        exc=teardown_error,
+                    )
+            try:
+                await self._persist_messages_since(persisted_count)
+            except Exception as exc:
+                with suppress(Exception):
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=context,
+                        phase="agent_loop_cancel_cleanup",
+                        exc=exc,
+                    )
+                raise CodingRunCleanupError(
+                    "Failed to persist messages while cancelling the coding run"
+                ) from exc
+            raise
         except Exception as exc:
+            if (
+                runtime_lease is not None
+                and self._runtime_cancellation_requested is not None
+                and self._runtime_cancellation_requested()
+            ):
+                try:
+                    await self._persist_messages_since(persisted_count)
+                except Exception as cleanup_exc:
+                    raise CodingRunCleanupError(
+                        "Failed to persist messages while cancelling the coding run"
+                    ) from cleanup_exc
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
                 phase="agent_loop",
                 exc=exc,
             )
             raise
+        finally:
+            await _close_async_iterator(events)
 
-    def _diagnostic_context(self) -> AgentCallDiagnosticContext:
+    def _diagnostic_context(self, *, run_id: str | None = None) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
             provider_name=self._provider_name,
             model=self.model,
             cwd=self.cwd,
             session_id=self.session_id,
-            run_id=new_agent_call_run_id(),
+            run_id=run_id or new_agent_call_run_id(),
         )
 
     async def _persist_loaded_interrupted_tool_repairs(self) -> None:
@@ -1758,6 +2569,12 @@ class CodingSession:
         )
 
     async def _persist_messages_since(self, persisted_count: int) -> int:
+        """Persist a transcript suffix as one serialized tree mutation."""
+
+        async with self._tree_mutation_lock:
+            return await self._persist_messages_since_unlocked(persisted_count)
+
+    async def _persist_messages_since_unlocked(self, persisted_count: int) -> int:
         """Persist completed harness messages after ``persisted_count``.
 
         Message lifecycle events are the durable-message boundary. Each persisted
@@ -1784,7 +2601,11 @@ class CodingSession:
         self._context_usage_cache = None
 
     async def _refresh_persisted_state(self, *, leaf_id: str | None) -> None:
-        entries = await self._read_session_entries()
+        try:
+            entries = await self._read_session_entries()
+        except Exception as exc:
+            self._mark_durability_failure(exc)
+            raise
         self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
@@ -1795,12 +2616,17 @@ class CodingSession:
 
     async def _read_session_entries(self) -> list[SessionEntry]:
         """Read stored entries, detaching roots imported from external history."""
-        return _detach_missing_parents(await self._config.storage.read_all())
+        entries = await _await_durable(self._config.storage.read_all())
+        return _detach_missing_parents(entries)
 
     async def _append_session_entry(self, entry: SessionEntry) -> None:
         """Append one durable entry after flushing deferred session metadata."""
-        await self._ensure_session_initialized()
-        await self._config.storage.append(entry)
+        try:
+            await self._ensure_session_initialized()
+            await _await_durable(self._config.storage.append(entry))
+        except Exception as exc:
+            self._mark_durability_failure(exc)
+            raise
 
     async def _ensure_session_initialized(self) -> None:
         if not self._pending_initial_entries:
@@ -1810,9 +2636,10 @@ class CodingSession:
             self._index_current_session()
 
     async def _write_pending_initial_entries(self) -> None:
-        for entry in self._pending_initial_entries:
-            await self._config.storage.append(entry)
-        self._pending_initial_entries = ()
+        while self._pending_initial_entries:
+            entry = self._pending_initial_entries[0]
+            await _await_durable(self._config.storage.append(entry))
+            self._pending_initial_entries = self._pending_initial_entries[1:]
 
     def _ensure_session_file_initialized(self) -> None:
         if not self._pending_initial_entries:
@@ -1848,6 +2675,8 @@ class CodingSession:
                 phase=phase,
                 exc=exc,
             )
+            if self._durability_error is not None:
+                raise
             return False
 
     async def _try_overflow_compact(
@@ -1868,6 +2697,8 @@ class CodingSession:
                 phase="overflow_compact",
                 exc=exc,
             )
+            if self._durability_error is not None:
+                raise
             return False
 
     async def _try_auto_name_session(
@@ -2053,6 +2884,18 @@ class CodingSession:
         return tuple(zip(self._state.context_entry_ids, self._state.messages, strict=True))
 
     async def _append_compaction(
+        self,
+        summary: str,
+        *,
+        replace_entry_ids: tuple[str, ...],
+    ) -> CompactionEntry:
+        async with self._tree_mutation_lock:
+            return await self._append_compaction_unlocked(
+                summary,
+                replace_entry_ids=replace_entry_ids,
+            )
+
+    async def _append_compaction_unlocked(
         self,
         summary: str,
         *,

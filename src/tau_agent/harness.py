@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Literal
 
-from tau_agent.events import AgentEvent
+from tau_agent.events import AgentEndEvent, AgentEvent
 from tau_agent.loop import AfterToolCall, BeforeToolCall, run_agent_loop
 from tau_agent.messages import (
     AgentMessage,
@@ -72,6 +72,8 @@ class AgentHarness:
         self._listeners: list[EventListener] = []
         self._current_signal: SimpleCancellationToken | None = None
         self._running = False
+        self._accepting_controls = False
+        self._runtime_lease: object | None = None
         self._steering_queue: deque[AgentMessage] = deque()
         self._follow_up_queue: deque[AgentMessage] = deque()
 
@@ -85,7 +87,13 @@ class AgentHarness:
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return self._running or self._runtime_lease is not None
+
+    @property
+    def accepting_controls(self) -> bool:
+        """Return whether an active run can still consume queued controls."""
+
+        return self._accepting_controls
 
     @property
     def queued_messages(self) -> QueuedMessages:
@@ -99,9 +107,11 @@ class AgentHarness:
         return bool(self._steering_queue or self._follow_up_queue)
 
     def append_message(self, message: AgentMessage) -> None:
+        self._ensure_not_runtime_owned()
         self._messages.append(message)
 
     def replace_messages(self, messages: Sequence[AgentMessage]) -> None:
+        self._ensure_not_runtime_owned()
         self._messages = list(messages)
 
     def subscribe(self, listener: EventListener) -> Callable[[], None]:
@@ -114,6 +124,10 @@ class AgentHarness:
         return unsubscribe
 
     def cancel(self) -> None:
+        self._ensure_not_runtime_owned()
+        self._cancel()
+
+    def _cancel(self) -> None:
         if self._current_signal is not None:
             self._current_signal.cancel()
 
@@ -121,6 +135,11 @@ class AgentHarness:
         return self.steer_message(UserMessage(content=content))
 
     def steer_message(self, message: AgentMessage) -> QueuedMessages:
+        self._ensure_not_runtime_owned()
+        self._ensure_accepting_controls()
+        return self._steer_message(message)
+
+    def _steer_message(self, message: AgentMessage) -> QueuedMessages:
         self._steering_queue.append(message)
         return self.queued_messages
 
@@ -128,35 +147,68 @@ class AgentHarness:
         return self.follow_up_message(UserMessage(content=content))
 
     def follow_up_message(self, message: AgentMessage) -> QueuedMessages:
+        self._ensure_not_runtime_owned()
+        self._ensure_accepting_controls()
+        return self._follow_up_message(message)
+
+    def _follow_up_message(self, message: AgentMessage) -> QueuedMessages:
         self._follow_up_queue.append(message)
         return self.queued_messages
 
     def clear_queues(self) -> QueuedMessages:
+        self._ensure_not_runtime_owned()
+        return self._clear_queues()
+
+    def _clear_queues(self) -> QueuedMessages:
         snapshot = self.queued_messages
         self._steering_queue.clear()
         self._follow_up_queue.clear()
         return snapshot
 
     def pop_latest_follow_up(self) -> AgentMessage | None:
+        self._ensure_not_runtime_owned()
         return self._follow_up_queue.pop() if self._follow_up_queue else None
 
     def pop_latest_steering(self) -> AgentMessage | None:
+        self._ensure_not_runtime_owned()
         return self._steering_queue.pop() if self._steering_queue else None
 
     def prompt_message(self, message: AgentMessage) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()
+        return self._start_run(prompts=(message,))
+
+    def _prompt_with_runtime_lease(
+        self,
+        content: str,
+        lease: object,
+    ) -> AsyncIterator[AgentEvent]:
+        self._ensure_runtime_lease(lease)
+        return self._start_run(prompts=(UserMessage(content=content),))
+
+    def _start_run(
+        self,
+        *,
+        prompts: Sequence[AgentMessage] = (),
+    ) -> AsyncIterator[AgentEvent]:
+        if self._running:
+            raise RuntimeError(
+                "AgentHarness is already running; use steer() or follow_up() to queue messages."
+            )
         self._append_interrupted_tool_results()
         self._running = True
-        return self._run(prompts=(message,))
+        self._accepting_controls = True
+        return self._run(prompts=prompts)
 
     def prompt(self, content: str) -> AsyncIterator[AgentEvent]:
         return self.prompt_message(UserMessage(content=content))
 
     def continue_(self) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()
-        self._append_interrupted_tool_results()
-        self._running = True
-        return self._run()
+        return self._start_run()
+
+    def _continue_with_runtime_lease(self, lease: object) -> AsyncIterator[AgentEvent]:
+        self._ensure_runtime_lease(lease)
+        return self._start_run()
 
     async def _run(
         self,
@@ -180,6 +232,8 @@ class AgentHarness:
                 before_tool_call=self._config.before_tool_call,
                 after_tool_call=self._config.after_tool_call,
             ):
+                if isinstance(event, AgentEndEvent):
+                    self._accepting_controls = False
                 await self._notify(event)
                 yield event
         finally:
@@ -187,6 +241,7 @@ class AgentHarness:
                 self._append_interrupted_tool_results()
             if self._current_signal is signal:
                 self._current_signal = None
+            self._accepting_controls = False
             self._running = False
 
     async def _notify(self, event: AgentEvent) -> None:
@@ -196,10 +251,60 @@ class AgentHarness:
                 await result
 
     def _ensure_not_running(self) -> None:
+        if self._runtime_lease is not None:
+            raise RuntimeError("AgentHarness is reserved by LocalAgentRuntime")
         if self._running:
             raise RuntimeError(
                 "AgentHarness is already running; use steer() or follow_up() to queue messages."
             )
+
+    def _ensure_not_runtime_owned(self) -> None:
+        if self._runtime_lease is not None:
+            raise RuntimeError("AgentHarness is owned by LocalAgentRuntime; use its run handle")
+
+    def _ensure_accepting_controls(self) -> None:
+        if self._running and not self._accepting_controls:
+            raise RuntimeError("AgentHarness is settling and no longer accepts controls")
+
+    def _claim_runtime_lease(self) -> object:
+        self._ensure_not_running()
+        lease = object()
+        self._runtime_lease = lease
+        return lease
+
+    def _ensure_runtime_lease(self, lease: object) -> None:
+        if self._runtime_lease is not lease:
+            raise RuntimeError("AgentHarness runtime lease is not held by this run")
+
+    def _release_runtime_lease(self, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        if self._running:
+            raise RuntimeError("Cannot release an AgentHarness lease while it is running")
+        self._runtime_lease = None
+
+    def _cancel_with_runtime_lease(self, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        self._cancel()
+
+    def _steer_with_runtime_lease(self, content: str, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        self._ensure_accepting_controls()
+        self._steer_message(UserMessage(content=content))
+
+    def _follow_up_with_runtime_lease(self, content: str, lease: object) -> None:
+        self._ensure_runtime_lease(lease)
+        self._ensure_accepting_controls()
+        self._follow_up_message(UserMessage(content=content))
+
+    def _clear_queues_with_runtime_lease(self, lease: object) -> QueuedMessages:
+        self._ensure_runtime_lease(lease)
+        return self._clear_queues()
+
+    def _repair_with_runtime_lease(self, lease: object) -> int:
+        self._ensure_runtime_lease(lease)
+        before = len(self._messages)
+        self._append_interrupted_tool_results()
+        return len(self._messages) - before
 
     def _drain_steering_messages(self) -> tuple[AgentMessage, ...]:
         return self._drain_queue(self._steering_queue)
@@ -217,6 +322,7 @@ class AgentHarness:
         return (queue.popleft(),)
 
     def append_interrupted_tool_results(self) -> int:
+        self._ensure_not_runtime_owned()
         before = len(self._messages)
         self._append_interrupted_tool_results()
         return len(self._messages) - before

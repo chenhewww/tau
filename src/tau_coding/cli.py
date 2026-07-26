@@ -11,7 +11,10 @@ from typing import Annotated
 import anyio
 import typer
 
+from tau_agent.events import MessageEndEvent
+from tau_agent.messages import AssistantMessage
 from tau_agent.provider import ModelProvider
+from tau_agent.runtime import RunStatus
 from tau_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from tau_ai.env import (
     DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
@@ -62,6 +65,15 @@ from tau_coding.update_check import (
 )
 from tau_coding.updater import update_tau
 from tau_coding.version import current_version as _current_version
+
+_TRACE_RUN_SUPPRESSED_EVENT_TYPES = frozenset(
+    {
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_update",
+    }
+)
 
 
 def _is_utf8_encoding(encoding: str | None) -> bool:
@@ -205,6 +217,20 @@ def main(
             "(text, json, or transcript).",
         ),
     ] = None,
+    trace_run: Annotated[
+        bool,
+        typer.Option(
+            "--trace-run",
+            help="Show a concise run lifecycle summary in print mode.",
+        ),
+    ] = False,
+    trace_run_events: Annotated[
+        bool,
+        typer.Option(
+            "--trace-run-events",
+            help="Show every raw run event in print mode (very verbose).",
+        ),
+    ] = False,
     output: Annotated[
         PrintOutputMode | None,
         typer.Option(
@@ -313,6 +339,10 @@ def main(
     print_requested = print_mode or mode is not None
     effective_output = mode or PrintOutputMode.text
 
+    trace_requested = trace_run or trace_run_events
+    if trace_requested and not print_requested:
+        raise typer.BadParameter("--trace-run/--trace-run-events require --print or --mode.")
+
     positional_args = prompt_args or []
     command = positional_args[0] if positional_args else None
     initial_prompt = " ".join(positional_args) if positional_args else None
@@ -400,6 +430,8 @@ def main(
             extension_paths,
             not no_extensions,
             project_extensions,
+            trace_requested,
+            trace_run_events,
         )
     except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -655,6 +687,8 @@ async def run_openai_print_mode(
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    trace_run: bool = False,
+    trace_run_events: bool = False,
 ) -> bool:
     """Run print mode with the OpenAI-compatible provider configured from the environment."""
     settings = load_provider_settings()
@@ -684,6 +718,8 @@ async def run_openai_print_mode(
             extension_paths=extension_paths,
             extensions_enabled=extensions_enabled,
             project_extensions_enabled=project_extensions_enabled,
+            trace_run=trace_run,
+            trace_run_events=trace_run_events,
         )
     finally:
         await provider.aclose()
@@ -707,12 +743,15 @@ async def run_print_mode(
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    trace_run: bool = False,
+    trace_run_events: bool = False,
 ) -> bool:
     """Run one non-interactive prompt and print streamed events.
 
     Returns False when the agent emits a non-recoverable error so CLI callers
     can fail non-interactive runs while still rendering the error message.
     """
+    trace_run = trace_run or trace_run_events
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -731,13 +770,13 @@ async def run_print_mode(
             project_extensions_enabled=project_extensions_enabled,
         )
     )
-    session.extension_runtime.set_ui_bridge(StderrUiBridge())
-    await session.emit_pending_session_start()
-    renderer = create_event_renderer(
-        output,
-        custom_message_renderer=session.extension_runtime.render_custom_message,
-    )
     try:
+        session.extension_runtime.set_ui_bridge(StderrUiBridge())
+        await session.emit_pending_session_start()
+        renderer = create_event_renderer(
+            output,
+            custom_message_renderer=session.extension_runtime.render_custom_message,
+        )
         terminal_command = parse_terminal_command(prompt)
         if terminal_command is not None:
             result = await session.run_terminal_command(
@@ -759,9 +798,79 @@ async def run_print_mode(
             if message:
                 typer.echo(message)
             return True
-        async for event in session.prompt(prompt):
+        run = session.start_run(prompt)
+        if trace_run:
+            snapshot = run.snapshot
+            typer.echo(
+                f"[tau run] created run_id={run.run_id} "
+                f"session_id={snapshot.session_id or '-'} status={snapshot.status.value}",
+                err=True,
+            )
+        cancellation_message: str | None = None
+        last_assistant_error: str | None = None
+        suppressed_event_counts: dict[str, int] = {}
+        async for envelope in run.events():
+            event = envelope.event
+            if trace_run:
+                if trace_run_events or event.type not in _TRACE_RUN_SUPPRESSED_EVENT_TYPES:
+                    typer.echo(
+                        f"[tau run] event sequence={envelope.sequence:02d} type={event.type}",
+                        err=True,
+                    )
+                else:
+                    suppressed_event_counts[event.type] = (
+                        suppressed_event_counts.get(event.type, 0) + 1
+                    )
+            if isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+                if event.message.stop_reason == "aborted":
+                    cancellation_message = event.message.error_message
+                elif event.message.stop_reason == "error":
+                    last_assistant_error = event.message.error_message or "Agent run failed"
             renderer.render(event)
-        return renderer.finish()
+        run_result = await run.result()
+        if trace_run:
+            snapshot = run_result.snapshot
+            if suppressed_event_counts:
+                counts = " ".join(
+                    f"{event_type}={count}"
+                    for event_type, count in sorted(suppressed_event_counts.items())
+                )
+                typer.echo(f"[tau run] stream-summary {counts}", err=True)
+            replay_cursor = max(0, snapshot.last_event_sequence - 2)
+            replayed = [event.sequence async for event in run.events(after_sequence=replay_cursor)]
+            typer.echo(
+                f"[tau run] settled status={snapshot.status.value} "
+                f"events={snapshot.event_count} turns={snapshot.turn_count} "
+                f"tools={snapshot.tool_call_count} messages={len(run_result.messages)}",
+                err=True,
+            )
+            typer.echo(
+                f"[tau run] replay after={replay_cursor} sequences={replayed}",
+                err=True,
+            )
+            typer.echo(
+                "[tau run] persistence=settled"
+                if snapshot.status is RunStatus.SUCCEEDED
+                else f"[tau run] persistence=not-confirmed status={snapshot.status.value}",
+                err=True,
+            )
+        rendered_successfully = renderer.finish()
+        if (
+            run_result.snapshot.status is RunStatus.FAILED
+            and run_result.snapshot.error
+            and (
+                run_result.snapshot.error != last_assistant_error
+                or (output is PrintOutputMode.text and rendered_successfully)
+            )
+        ):
+            typer.echo(f"Error: {run_result.snapshot.error}", err=True)
+        elif (
+            run_result.snapshot.status is RunStatus.CANCELLED
+            and rendered_successfully
+            and output is not PrintOutputMode.json
+        ):
+            typer.echo(f"Cancelled: {cancellation_message or 'Run cancelled'}", err=True)
+        return run_result.snapshot.status is RunStatus.SUCCEEDED
     finally:
         await session.aclose()
 

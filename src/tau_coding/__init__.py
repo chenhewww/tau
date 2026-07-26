@@ -102,6 +102,7 @@ from tau_coding.rendering import (
     create_event_renderer,
 )
 from tau_coding.resources import ResourceDiagnostic, ResourceError, TauResourcePaths
+from tau_coding.runtime import CodingRunEvent, CodingRunHandle, LocalCodingSessionRuntime
 from tau_coding.session import (
     CodingSession,
     CodingSessionConfig,
@@ -173,6 +174,8 @@ __all__ = [
     "__version__",
     "CodingSession",
     "CodingSessionConfig",
+    "CodingRunEvent",
+    "CodingRunHandle",
     "CodingSessionRecord",
     "CommandRegistry",
     "CommandResult",
@@ -185,6 +188,7 @@ __all__ = [
     "FinalTextRenderer",
     "JsonEventRenderer",
     "ModelChoice",
+    "LocalCodingSessionRuntime",
     "SessionTreeBranchResult",
     "SessionTreeChoice",
     "AnthropicProviderConfig",

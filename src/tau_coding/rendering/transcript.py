@@ -14,7 +14,7 @@ from tau_agent.events import (
 )
 from tau_agent.messages import AssistantMessage, CustomMessage, ToolCall
 from tau_ai.events import TextDeltaEvent
-from tau_coding.events import AutoRetryStartEvent, CodingSessionEvent
+from tau_coding.events import AutoRetryStartEvent, CodingSessionEvent, SessionAgentEndEvent
 from tau_coding.extensions.api import CustomMessageMarkup
 from tau_coding.tui.state import format_tool_call_block
 
@@ -53,6 +53,9 @@ class TranscriptRenderer:
         if isinstance(event, AutoRetryStartEvent):
             self._newline()
             self._console.print(Text(f"… {event.error_message}", style="bright_black"))
+            self._assistant_started = False
+            self._assistant_ended = False
+            self._failed = False
             return
         if isinstance(event, ToolExecutionEndEvent):
             status = "✗" if event.is_error else "✓"
@@ -76,12 +79,17 @@ class TranscriptRenderer:
                 self._console.print(rendered)
             return
         if isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+            self._failed = event.message.stop_reason == "error"
             if event.message.stop_reason == "error":
-                self._failed = True
                 self._newline()
                 self._console.print(
                     Text(f"Error: {event.message.error_message or 'Error'}", style="red")
                 )
+            self._newline(final=True)
+            return
+        if isinstance(event, SessionAgentEndEvent):
+            if event.will_retry:
+                self._failed = False
             self._newline(final=True)
             return
         if isinstance(event, AgentEndEvent):

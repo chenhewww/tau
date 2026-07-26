@@ -3177,14 +3177,20 @@ class TauTuiApp(App[None]):
             )
             return
 
-        command = self.session.handle_command(text)
+        try:
+            command = self.session.handle_command(text)
+        except RuntimeError as exc:
+            prompt.text = raw_text
+            prompt.move_cursor(_text_end_location(raw_text))
+            self._notify(str(exc), severity="warning")
+            return
         if command.handled:
             if command.clear_requested:
                 self.state.clear()
             if command.reload_requested:
                 try:
                     summary = await self.session.reload()
-                except ValueError as exc:
+                except (RuntimeError, ValueError) as exc:
                     command = replace(command, message=f"Could not reload: {exc}")
                 else:
                     command = replace(command, message=format_reload_summary(summary))
@@ -4190,14 +4196,19 @@ class TauTuiApp(App[None]):
             self._notify("Cancelled compaction.")
         return True
 
-    def _cancel_active_prompt(self, *, notify: bool, interrupt: bool = False) -> None:
+    def _cancel_active_prompt(
+        self,
+        *,
+        notify: bool,
+        interrupt: bool = False,
+    ) -> Worker[None] | None:
         """Cancel the active prompt worker and ignore any late events from it."""
         del interrupt
         worker = self._prompt_worker
         is_worker_active = worker is not None and not worker.is_cancelled
         is_session_running = bool(getattr(self.session, "is_running", False))
         if not (self.state.running or is_session_running or is_worker_active):
-            return
+            return None
 
         self._prompt_run_id += 1
         cancel = getattr(self.session, "cancel", None)
@@ -4212,6 +4223,7 @@ class TauTuiApp(App[None]):
         self._refresh()
         if notify:
             self._notify("Interrupted current operation.")
+        return worker
 
     def action_accept_completion(self) -> None:
         """Accept the currently selected prompt completion."""
@@ -4492,7 +4504,13 @@ class TauTuiApp(App[None]):
         self._refresh()
 
     async def _new_session(self) -> None:
-        self._cancel_active_prompt(notify=False, interrupt=True)
+        cancelled_worker = self._cancel_active_prompt(notify=False, interrupt=True)
+        if cancelled_worker is not None:
+            # Worker.cancel() only requests cancellation. Waiting here lets the
+            # caller-owned prompt generator release its session operation lease
+            # before new_session() tries to claim the same slot.
+            with suppress(Exception):
+                await cancelled_worker.wait()
         new_session = getattr(self.session, "new_session", None)
         if new_session is None:
             self._notify("Session manager is not available.")
